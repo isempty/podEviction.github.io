@@ -190,3 +190,417 @@ Kubernetes에서 pod eviction 전에 특정 동작을 삽입하거나 특정 pod
 - [Scheduling, Preemption and Eviction](https://kubernetes.io/docs/concepts/scheduling-eviction/)
 - [Ultimate Guide Of Pod Eviction On Kubernetes](https://devtron.ai/blog/ultimate-guide-of-pod-eviction-on-kubernetes/)
 - [k-vswitch GitHub](https://github.com/k-vswitch/k-vswitch)
+
+
+
+
+
+### 주요 요약
+Kubernetes에서 OVS(Open vSwitch) pod의 eviction으로 인해 flow cache가 남아 네트워크 문제가 발생하는 상황을 해결하기 위해, 커스텀 컨트롤러를 설정하여 pod 삭제 이벤트를 감지하고 `ovs-ofctl` 명령어를 실행해 flow cache를 정리하는 방법을 구현할 수 있습니다. 이 과정은 DaemonSet을 활용해 각 노드에서 동작하며, Kubernetes API와 RBAC 설정이 필요합니다. 아래는 이 커스텀 컨트롤러를 처음부터 단계별로 구현하는 상세한 설명입니다.
+
+---
+
+### 간단한 설명
+커스텀 컨트롤러는 Kubernetes 클러스터의 각 노드에서 실행되는 DaemonSet으로 구현됩니다. 이 DaemonSet은:
+1. Kubernetes API를 통해 pod 삭제 이벤트를 감지합니다.
+2. 삭제된 pod이 OVS pod(예: `app=ovs` 레이블)와 관련 있는지 확인합니다.
+3. 해당 노드에서 `ovs-ofctl del-flows` 명령어를 실행해 flow cache를 정리합니다.
+
+구현에는 Go 언어와 client-go 라이브러리를 사용하거나, 더 간단히 bash 스크립트를 활용한 DaemonSet으로 시작할 수 있습니다. 이 설명에서는 초보자도 따라 할 수 있도록 bash 스크립트 기반의 DaemonSet 구현을 먼저 다루고, 고급 구현으로 Go 기반 컨트롤러를 간략히 소개합니다.
+
+---
+
+### 상세 구현: 단계별 설명
+
+#### 1. 환경 준비
+- **필요 조건**:
+  - Kubernetes 클러스터가 실행 중이며, OVS 기반 CNI(예: k-vswitch)가 설정되어 있어야 합니다.
+  - 각 노드에 `openvswitch-switch` 패키지가 설치되어 `ovs-ofctl` 명령어를 실행할 수 있어야 합니다.
+  - kubectl CLI가 설치되어 있어야 합니다.
+- **작업 환경**:
+  - 로컬 머신에서 YAML 파일과 스크립트를 작성합니다.
+  - 클러스터에 관리자 권한이 있는 kubeconfig 파일이 필요합니다.
+
+#### 2. OVS 브리지 및 Flow 구조 확인
+OVS flow cache를 정리하려면 브리지 이름과 flow 구조를 알아야 합니다.
+- **브리지 이름 확인**:
+  ```bash
+  ssh <node> 'ovs-vsctl show'
+  ```
+  출력 예:
+  ```
+  Bridge "k-vswitch0"
+      Port "veth1234"
+          Interface "veth1234"
+  ```
+  여기서 `k-vswitch0`가 브리지 이름입니다.
+- **Flow 확인**:
+  ```bash
+  ssh <node> 'ovs-ofctl dump-flows k-vswitch0'
+  ```
+  출력 예:
+  ```
+  table=0, n_packets=10, n_bytes=1000, priority=100,ip,nw_src=10.244.1.5 actions=set_field:12345->reg0,resubmit(,1)
+  ```
+  이 경우, `table=0`에 pod IP `10.244.1.5`가 `reg0=12345`로 매핑되어 있습니다. 따라서 `ovs-ofctl del-flows k-vswitch0 "reg0=12345"`로 flow를 삭제할 수 있습니다.
+
+#### 3. RBAC 설정
+DaemonSet이 Kubernetes API에 접근해 pod 목록을 조회하고 이벤트를 감지하려면 RBAC 권한이 필요합니다.
+- **ClusterRole 생성**:
+  ```yaml
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRole
+  metadata:
+    name: pod-monitor-role
+  rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  ```
+  저장: `pod-monitor-role.yaml`
+  적용:
+  ```bash
+  kubectl apply -f pod-monitor-role.yaml
+  ```
+- **ServiceAccount 생성**:
+  ```yaml
+  apiVersion: v1
+  kind: ServiceAccount
+  metadata:
+    name: pod-monitor-sa
+    namespace: kube-system
+  ```
+  저장: `pod-monitor-sa.yaml`
+  적용:
+  ```bash
+  kubectl apply -f pod-monitor-sa.yaml
+  ```
+- **ClusterRoleBinding 생성**:
+  ```yaml
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    name: pod-monitor-binding
+  subjects:
+  - kind: ServiceAccount
+    name: pod-monitor-sa
+    namespace: kube-system
+  roleRef:
+    kind: ClusterRole
+    name: pod-monitor-role
+    apiGroup: rbac.authorization.k8s.io
+  ```
+  저장: `pod-monitor-binding.yaml`
+  적용:
+  ```bash
+  kubectl apply -f pod-monitor-binding.yaml
+  ```
+
+#### 4. DaemonSet용 스크립트 작성
+DaemonSet에서 실행할 bash 스크립트를 작성해 pod 삭제 이벤트를 감지하고 flow cache를 정리합니다.
+- **스크립트 내용**:
+  ```bash
+  #!/bin/bash
+  # flow-cleanup.sh
+
+  # 환경 변수 설정
+  BRIDGE_NAME="k-vswitch0"  # OVS 브리지 이름
+  KUBE_CONFIG="/root/.kube/config"
+  NAMESPACE="default"  # OVS pod이 있는 네임스페이스
+  LABEL_SELECTOR="app=ovs"  # OVS pod 식별 레이블
+
+  # pod 삭제 이벤트 감지
+  while true; do
+    # 최근 삭제된 pod 확인
+    DELETED_PODS=$(kubectl --kubeconfig=$KUBE_CONFIG get pods -n $NAMESPACE -l $LABEL_SELECTOR -o json | jq -r '.items[] | select(.metadata.deletionTimestamp != null) | .status.podIP')
+    
+    for POD_IP in $DELETED_PODS; do
+      if [ -n "$POD_IP" ]; then
+        echo "Detected deleted pod with IP: $POD_IP"
+        # flow 삭제 명령어 실행
+        ovs-ofctl del-flows $BRIDGE_NAME "reg0=$POD_IP"
+        echo "Deleted flows for pod IP: $POD_IP"
+      fi
+    done
+    sleep 5  # 5초마다 체크
+  done
+  ```
+  저장: `flow-cleanup.sh`
+- **설명**:
+  - `kubectl get pods`로 OVS pod(`app=ovs`)를 조회하고, `.metadata.deletionTimestamp`가 있는 pod(삭제된 pod)을 필터링합니다.
+  - `.status.podIP`를 추출해 flow 삭제 명령어에 사용합니다.
+  - `ovs-ofctl del-flows`로 해당 pod IP와 관련된 flow를 삭제합니다.
+- **권한 부여**:
+  ```bash
+  chmod +x flow-cleanup.sh
+  ```
+
+#### 5. DaemonSet YAML 작성
+DaemonSet을 정의해 각 노드에서 스크립트를 실행합니다.
+- **DaemonSet YAML**:
+  ```yaml
+  apiVersion: apps/v1
+  kind: DaemonSet
+  metadata:
+    name: flow-cleanup
+    namespace: kube-system
+    labels:
+      app: flow-cleanup
+  spec:
+    selector:
+      matchLabels:
+        app: flow-cleanup
+    template:
+      metadata:
+        labels:
+          app: flow-cleanup
+      spec:
+        serviceAccountName: pod-monitor-sa
+        hostNetwork: true  # 노드 네트워크 접근
+        containers:
+        - name: flow-cleanup
+          image: bitnami/kubectl:latest  # kubectl과 ovs-ofctl이 포함된 이미지
+          command: ["/bin/bash", "/scripts/flow-cleanup.sh"]
+          securityContext:
+            privileged: true  # OVS 명령어 실행을 위한 권한
+          volumeMounts:
+          - name: scripts
+            mountPath: /scripts
+          - name: kubeconfig
+            mountPath: /root/.kube
+        volumes:
+        - name: scripts
+          configMap:
+            name: flow-cleanup-script
+        - name: kubeconfig
+          hostPath:
+            path: /root/.kube  # 노드의 kubeconfig 경로
+  ```
+  저장: `flow-cleanup-daemonset.yaml`
+- **ConfigMap으로 스크립트 제공**:
+  ```yaml
+  apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: flow-cleanup-script
+    namespace: kube-system
+  data:
+    flow-cleanup.sh: |
+      #!/bin/bash
+      BRIDGE_NAME="k-vswitch0"
+      KUBE_CONFIG="/root/.kube/config"
+      NAMESPACE="default"
+      LABEL_SELECTOR="app=ovs"
+      while true; do
+        DELETED_PODS=$(kubectl --kubeconfig=$KUBE_CONFIG get pods -n $NAMESPACE -l $LABEL_SELECTOR -o json | jq -r '.items[] | select(.metadata.deletionTimestamp != null) | .status.podIP')
+        for POD_IP in $DELETED_PODS; do
+          if [ -n "$POD_IP" ]; then
+            echo "Detected deleted pod with IP: $POD_IP"
+            ovs-ofctl del-flows $BRIDGE_NAME "reg0=$POD_IP"
+            echo "Deleted flows for pod IP: $POD_IP"
+          fi
+        done
+        sleep 5
+      done
+  ```
+  저장: `flow-cleanup-script.yaml`
+- **적용**:
+  ```bash
+  kubectl apply -f flow-cleanup-script.yaml
+  kubectl apply -f flow-cleanup-daemonset.yaml
+  ```
+
+#### 6. 테스트 및 검증
+- **OVS pod 삭제 시뮬레이션**:
+  ```bash
+  kubectl delete pod -l app=ovs -n default
+  ```
+- **DaemonSet 로그 확인**:
+  ```bash
+  kubectl logs -l app=flow-cleanup -n kube-system
+  ```
+  예상 출력:
+  ```
+  Detected deleted pod with IP: 10.244.1.5
+  Deleted flows for pod IP: 10.244.1.5
+  ```
+- **Flow 확인**:
+  ```bash
+  ssh <node> 'ovs-ofctl dump-flows k-vswitch0'
+  ```
+  삭제된 pod IP와 관련된 flow가 사라  제거되었는지 확인합니다.
+- **네트워크 테스트**: 쿼럼 서버 외의 세션 연결이 정상적으로 작동하는지 확인합니다.
+
+#### 7. 고급 구현: Go 기반 커스텀 컨트롤러
+Bash 스크립트는 간단하지만, 안정성과 확장성을 위해 Go와 client-go 라이브러리를 사용한 컨트롤러를 고려할 수 있습니다.
+- **의존성 설치**:
+  ```bash
+  go get k8s.io/client-go
+  go get k8s.io/apimachinery
+  ```
+- **코드 예제**:
+  ```go
+  package main
+
+  import (
+      "context"
+      "fmt"
+      "os/exec"
+      "k8s.io/client-go/kubernetes"
+      "k8s.io/client-go/tools/clientcmd"
+      "k8s.io/apimachinery/pkg/labels"
+      corev1 "k8s.io/api/core/v1"
+      metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+  )
+
+  func main() {
+      kubeconfig := "/root/.kube/config"
+      config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+      if err != nil {
+          panic(err)
+      }
+      clientset, err := kubernetes.NewForConfig(config)
+      if err != nil {
+          panic(err)
+      }
+
+      selector := labels.SelectorFromSet(labels.Set{"app": "ovs"})
+      listOptions := metav1.ListOptions{LabelSelector: selector.String()}
+      pods, err := clientset.CoreV1().Pods("default").List(context.TODO(), listOptions)
+      if err != nil {
+          panic(err)
+      }
+
+      for _, pod := range pods.Items {
+          if pod.DeletionTimestamp != nil {
+              podIP := pod.Status.PodIP
+              fmt.Printf("Deleting flows for pod IP: %s\n", podIP)
+              cmd := exec.Command("ovs-ofctl", "del-flows", "k-vswitch0", fmt.Sprintf("reg0=%s", podIP))
+              output, err := cmd.CombinedOutput()
+              if err != nil {
+                  fmt.Printf("Error deleting flows: %v\n", err)
+              } else {
+                  fmt.Printf("Output: %s\n", output)
+              }
+          }
+      }
+  }
+  ```
+  저장: `flow-cleanup.go`
+- **빌드 및 실행**:
+  ```bash
+  go build -o flow-cleanup flow-cleanup.go
+  ./flow-cleanup
+  ```
+- **배포**: 이 바이너리를 컨테이너 이미지로 빌드하고, DaemonSet의 컨테이너 이미지로 사용합니다.
+
+#### 8. 추가 최적화
+- **오류 처리**: 스크립트에 오류 로깅과 재시도 로직을 추가합니다.
+- **모니터링**: Prometheus와 Alertmanager를 설정해 flow 정리 실패 시 알림을 받습니다.
+- **테이블 지정**: 특정 테이블에서 flow를 삭제하려면 스크립트에서 `ovs-ofctl del-flows k-vswitch0 "table=0,reg0=$POD_IP"`로 수정합니다.
+
+---
+
+### 아티팩트: DaemonSet YAML
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: flow-cleanup
+  namespace: kube-system
+  labels:
+    app: flow-cleanup
+spec:
+  selector:
+    matchLabels:
+      app: flow-cleanup
+  template:
+    metadata:
+      labels:
+        app: flow-cleanup
+    spec:
+      serviceAccountName: pod-monitor-sa
+      hostNetwork: true
+      containers:
+      - name: flow-cleanup
+        image: bitnami/kubectl:latest
+        command: ["/bin/bash", "/scripts/flow-cleanup.sh"]
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: scripts
+          mountPath: /scripts
+        - name: kubeconfig
+          mountPath: /root/.kube
+      volumes: 
+      - name: scripts
+        configMap:
+          name: flow-cleanup-script
+      - name: kubeconfig
+        hostPath:
+          path: /root/.kube
+```
+
+### 아티팩트: ConfigMap YAML
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flow-cleanup-script
+  namespace: kube-system
+data:
+  flow-cleanup.sh: |
+    #!/bin/bash
+    BRIDGE_NAME="k-vswitch0"
+    KUBE_CONFIG="/root/.kube/config"
+    NAMESPACE="default"
+    LABEL_SELECTOR="app=ovs"
+    while true; do
+      DELETED_PODS=$(kubectl --kubeconfig=$KUBE_CONFIG get pods -n $NAMESPACE -l $LABEL_SELECTOR -o json | jq -r '.items[] | select(.metadata.deletionTimestamp != null) | .status.podIP')
+      for POD_IP in $DELETED_PODS; do
+        if [ -n "$POD_IP" ]; then
+          echo "Detected deleted pod with IP: $POD_IP"
+          ovs-ofctl del-flows $BRIDGE_NAME "reg0=$POD_IP"
+          echo "Deleted flows for pod IP: $POD_IP"
+        fi
+      done
+      sleep 5
+    done
+```
+
+---
+
+### 실행 지침
+1. RBAC 설정을 적용합니다:
+   ```bash
+   kubectl apply -f pod-monitor-role.yaml
+   kubectl apply -f pod-monitor-sa.yaml
+   kubectl apply -f pod-monitor-binding.yaml
+   ```
+2. ConfigMap과 DaemonSet을 배포합니다:
+   ```bash
+   kubectl apply -f flow-cleanup-script.yaml
+   kubectl apply -f flow-cleanup-daemonset.yaml
+   ```
+3. DaemonSet 상태를 확인합니다:
+   ```bash
+   kubectl get ds -n kube-system flow-cleanup
+   ```
+4. 로그를 확인해 동작을 검증합니다:
+   ```bash
+   kubectl logs -l app=flow-cleanup -n kube-system
+   ```
+
+---
+
+### 결론
+이 구현은 DaemonSet을 사용해 각 노드에서 pod 삭제 이벤트를 감지하고, `ovs-ofctl del-flows` 명령어를 실행해 OVS flow cache를 정리합니다. Bash 스크립트는 간단한 시작점이며, Go 기반 컨트롤러로 확장할 수 있습니다. 클러스터 환경에 따라 브리지 이름, 테이블 ID, pod IP 매핑을 조정하고, 테스트를 통해 안정성을 확인하세요.
+
+---
+
+### 주요 인용
+- [Kubernetes Node-Pressure Eviction](https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/)
+- [k-vswitch GitHub](https://github.com/k-vswitch/k-vswitch)
+- [Kubernetes Client-Go](https://github.com/kubernetes/client-go)
